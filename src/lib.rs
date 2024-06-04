@@ -116,7 +116,7 @@ fn map(file: &File) -> Result<MmapMut> {
 ///
 /// `msg_len` is the encoded size of the message in bytes. 
 /// `write_to_shm` allows for directly copying contents of the implementing struct into the 
-/// message's space in the buffer. This is incredibly unsafe and fully up to the deverloper
+/// message's space in the buffer. This is incredibly unsafe and fully up to the developer
 /// to account for padding, alignment, proper offsetting etc. or you will cause mayhem.
 pub trait ShmWriter {
     fn msg_len(&self) -> u32;
