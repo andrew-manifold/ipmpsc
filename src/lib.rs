@@ -119,8 +119,20 @@ fn map(file: &File) -> Result<MmapMut> {
 /// message's space in the buffer. This is incredibly unsafe and fully up to the developer
 /// to account for padding, alignment, proper offsetting etc. or you will cause mayhem.
 pub trait ShmWriter {
-    fn msg_len(&self) -> u32;
-    fn write_to_shm(&self, shm_ptr: *mut u8, msg_len: u32) -> Result<()>;
+    fn msg_len(&self) -> Result<u64>;
+    fn write_to_shm(&self, shm_ptr: &mut [u8]) -> Result<()>;
+}
+
+struct BincodeShmWriter<T: Serialize>(T);
+
+impl<T: Serialize> ShmWriter for BincodeShmWriter<T> {
+    fn msg_len(&self) -> Result<u64> {
+        Ok(bincode::serialized_size(&self.0)?)
+    }
+
+    fn write_to_shm(&self, writer: &mut [u8]) -> Result<()> {
+        Ok(bincode::serialize_into(writer, &self.0)?)
+    }
 }
 
 /// Represents a file-backed shared memory ring buffer, suitable for constructing a
@@ -242,19 +254,6 @@ impl Receiver {
         })
     }
 
-    /// Attempt to read a message without blocking. Returns a slice directly from the ring buffer
-    ///
-    /// This will return `Ok(None)` if there are no messages immediately available.
-    pub fn try_recv_direct<'a>(&'a self) -> Result<Option<&'a [u8]>>{
-        Ok(if let Some((value, position)) = self.try_recv_direct_0()? {
-            self.seek(position)?;
-
-            Some(value)
-        } else {
-            None
-        })
-    }
-
     fn try_recv_0<'a, T: Deserialize<'a>>(&'a self) -> Result<Option<(T, u32)>> {
         let buffer = self.0 .0.buffer();
         let map = buffer.map();
@@ -338,15 +337,6 @@ impl Receiver {
         Ok(value)
     }
 
-    /// Attempt to read a direct byte message, blocking if necessary until one becomes available.
-    pub fn recv_direct<'a>(&'a self) -> Result<&'a [u8]> {
-        let (value, position) = self.recv_direct_timeout_0(None)?.unwrap();
-
-        self.seek(position)?;
-
-        Ok(value)
-    }
-
     /// Attempt to read a message, blocking for up to the specified duration if necessary until one becomes
     /// available.
     pub fn recv_timeout<T>(&self, timeout: Duration) -> Result<Option<T>>
@@ -355,20 +345,6 @@ impl Receiver {
     {
         Ok(
             if let Some((value, position)) = self.recv_timeout_0(Some(timeout))? {
-                self.seek(position)?;
-
-                Some(value)
-            } else {
-                None
-            },
-        )
-    }
-
-    /// Attempt to read a direct byte message, blocking for up to the specified duration if necessary until one becomes
-    /// available.
-    pub fn recv_direct_timeout<'a>(&'a self, timeout: Duration) -> Result<Option<&'a [u8]>> {
-        Ok(
-            if let Some((value, position)) = self.recv_direct_timeout_0(Some(timeout))? {
                 self.seek(position)?;
 
                 Some(value)
@@ -616,7 +592,7 @@ impl Sender {
     /// greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
     pub fn send(&self, value: &impl Serialize) -> Result<()> {
-        self.send_timeout_0(value, false, None).map(drop)
+        unsafe { self.send_timeout_0(&BincodeShmWriter(value), false, None).map(drop) }
     }
 
     /// Send the specified message, waiting for sufficient contiguous space to become available in the ring buffer
@@ -629,7 +605,7 @@ impl Sender {
     /// greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
     pub fn send_timeout(&self, value: &impl Serialize, timeout: Duration) -> Result<bool> {
-        self.send_timeout_0(value, false, Some(timeout))
+        unsafe { self.send_timeout_0(&BincodeShmWriter(value), false, Some(timeout)) }
     }
 
     /// Send the specified message, waiting for the ring buffer to become completely empty first.
@@ -642,77 +618,7 @@ impl Sender {
     /// is greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
     pub fn send_when_empty(&self, value: &impl Serialize) -> Result<()> {
-        self.send_timeout_0(value, true, None).map(drop)
-    }
-
-    fn send_timeout_0(
-        &self,
-        value: &impl Serialize,
-        wait_until_empty: bool,
-        timeout: Option<Duration>,
-    ) -> Result<bool> {
-        let buffer = self.0 .0.buffer();
-        let map = self.0 .0.map_mut();
-
-        let size = bincode::serialized_size(value)? as u32;
-
-        if size == 0 {
-            return Err(Error::ZeroSizedMessage);
-        }
-
-        let map_len = map.len();
-
-        if (BEGINNING + size + 8) as usize > map_len {
-            return Err(Error::MessageTooLarge);
-        }
-
-        let mut lock = buffer.lock()?;
-        let mut deadline = None;
-        let mut write;
-        loop {
-            write = buffer.header().write.load(Relaxed);
-            let read = buffer.header().read.load(Relaxed);
-
-            if write == read || (write > read && !wait_until_empty) {
-                if (write + size + 8) as usize <= map_len {
-                    break;
-                } else if read != BEGINNING {
-                    assert!(write > BEGINNING);
-
-                    bincode::serialize_into(
-                        &mut map[write as usize..(write + 4) as usize],
-                        &0_u32,
-                    )?;
-                    write = BEGINNING;
-                    buffer.header().write.store(write, Release);
-                    lock.notify_all()?;
-                    continue;
-                }
-            } else if write + size + 8 <= read && !wait_until_empty {
-                break;
-            }
-
-            let now = Instant::now();
-            deadline = deadline.or_else(|| timeout.map(|timeout| now + timeout));
-
-            if deadline.map(|deadline| deadline > now).unwrap_or(true) {
-                lock.timed_wait(&self.0 .0, deadline.map(|deadline| deadline - now))?;
-            } else {
-                return Ok(false);
-            }
-        }
-
-        let start = write + 4;
-        bincode::serialize_into(&mut map[write as usize..start as usize], &size)?;
-
-        let end = start + size;
-        bincode::serialize_into(&mut map[start as usize..end as usize], value)?;
-
-        buffer.header().write.store(end, Release);
-
-        lock.notify_all()?;
-
-        Ok(true)
+        unsafe { self.send_timeout_0(&BincodeShmWriter(value), true, None).map(drop) }
     }
 
     /// Send the specified message, waiting for sufficient contiguous space to become available in the ring buffer
@@ -722,8 +628,8 @@ impl Sender {
     /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the message size is
     /// greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
-    pub fn send_direct(&self, value: &impl ShmWriter) -> Result<()> {
-        self.send_direct_timeout_0(value, false, None).map(drop)
+    pub unsafe fn send_direct(&self, value: &impl ShmWriter) -> Result<()> {
+        self.send_timeout_0(value, false, None).map(drop)
     }
 
     /// Send the specified message, waiting for sufficient contiguous space to become available in the ring buffer
@@ -736,8 +642,8 @@ impl Sender {
     /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the size is
     /// greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
-    pub fn send_direct_timeout(&self, value: &impl ShmWriter, timeout: Duration) -> Result<bool> {
-        self.send_direct_timeout_0(value, false, Some(timeout))
+    pub unsafe fn send_direct_timeout(&self, value: &impl ShmWriter, timeout: Duration) -> Result<bool> {
+        self.send_timeout_0(value, false, Some(timeout))
     }
 
     /// Send the specified message, waiting for the ring buffer to become completely empty first. Uses the lower 
@@ -750,11 +656,11 @@ impl Sender {
     /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the size
     /// is greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
-    pub fn send_direct_when_empty(&self, value: &impl ShmWriter) -> Result<()> {
-        self.send_direct_timeout_0(value, true, None).map(drop)
+    pub unsafe fn send_direct_when_empty(&self, value: &impl ShmWriter) -> Result<()> {
+        self.send_timeout_0(value, true, None).map(drop)
     }
 
-    fn send_direct_timeout_0(
+    unsafe fn send_timeout_0(
         &self,
         value: &impl ShmWriter,
         wait_until_empty: bool,
@@ -763,7 +669,7 @@ impl Sender {
         let buffer = self.0 .0.buffer();
         let map = self.0 .0.map_mut();
 
-        let size = value.msg_len();
+        let size = value.msg_len()? as u32;
 
         if size == 0 {
             return Err(Error::ZeroSizedMessage);
@@ -815,25 +721,22 @@ impl Sender {
             }
         }
 
-        unsafe {
-            // write our msg size first
-            std::ptr::copy_nonoverlapping(
-                size.to_be_bytes().as_ptr(), 
-                map.as_mut_ptr().offset(write as isize), 
-                4,
-            );
+        // write our msg size first
+        std::ptr::copy_nonoverlapping(
+            size.to_be_bytes().as_ptr(), 
+            map.as_mut_ptr().offset(write as isize), 
+            4,
+        );
 
-            let start = write + 4;
+        let start = write + 4;
 
-            let end = start + size;
+        let end = start + size;
 
-            value.write_to_shm(
-                map.as_mut_ptr().offset(start as isize), 
-                size,
-            )?;
+        value.write_to_shm(
+            &mut map[start as usize .. end as usize], 
+        )?;
 
-            buffer.header().write.store(end, Release);
-        }
+        buffer.header().write.store(end, Release);
 
         lock.notify_all()?;
 
