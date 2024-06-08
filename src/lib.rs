@@ -123,6 +123,7 @@ pub trait ShmWriter {
     fn write_to_shm(&self, shm_ptr: &mut [u8]) -> Result<()>;
 }
 
+// An internal wrapper to allow for a unified sender api. Uses bincode to handle encoding
 struct BincodeShmWriter<T: Serialize>(T);
 
 impl<T: Serialize> ShmWriter for BincodeShmWriter<T> {
@@ -245,48 +246,16 @@ impl Receiver {
     where
         T: for<'de> Deserialize<'de>,
     {
-        Ok(if let Some((value, position)) = self.try_recv_0()? {
+        Ok(if let Some((bytes, position)) = self.try_recv_0()? {
             self.seek(position)?;
 
-            Some(value)
+            Some(bincode::deserialize(bytes)?)
         } else {
             None
         })
     }
 
-    fn try_recv_0<'a, T: Deserialize<'a>>(&'a self) -> Result<Option<(T, u32)>> {
-        let buffer = self.0 .0.buffer();
-        let map = buffer.map();
-
-        let mut read = buffer.header().read.load(Relaxed);
-        let write = buffer.header().write.load(Acquire);
-
-        Ok(loop {
-            if write != read {
-                let slice = map.as_ref();
-                let start = read + 4;
-                let size = bincode::deserialize::<u32>(&slice[read as usize..start as usize])?;
-                if size > 0 {
-                    let end = start + size;
-                    break Some((
-                        bincode::deserialize(&slice[start as usize..end as usize])?,
-                        end,
-                    ));
-                } else if write < read {
-                    read = BEGINNING;
-                    let mut lock = buffer.lock()?;
-                    buffer.header().read.store(read, Relaxed);
-                    lock.notify_all()?;
-                } else {
-                    return Err(Error::Runtime("corrupt ring buffer".into()));
-                }
-            } else {
-                break None;
-            }
-        })
-    }
-
-    fn try_recv_direct_0<'a>(&'a self) -> Result<Option<(&'a [u8], u32)>> {
+    fn try_recv_0<'a>(&'a self) -> Result<Option<(&'a [u8], u32)>> {
         let buffer = self.0 .0.buffer();
         let map = buffer.map();
 
@@ -298,7 +267,8 @@ impl Receiver {
                 let slice = map.as_ref();
                 let start = read + 4;
 
-                // first 4 bytes is the length of the message
+                // first 4 bytes is the length of the message, need to be consistent with how sender formats message len irregardless
+                // of if bincode is used for encoding the message
                 let size = if let Ok(fixed) = slice[read as usize..start as usize].try_into() {
                     u32::from_be_bytes(fixed)
                 } else {
@@ -330,11 +300,11 @@ impl Receiver {
     where
         T: for<'de> Deserialize<'de>,
     {
-        let (value, position) = self.recv_timeout_0(None)?.unwrap();
+        let (bytes, position) = self.recv_timeout_0(None)?.unwrap();
 
         self.seek(position)?;
 
-        Ok(value)
+        Ok(bincode::deserialize(bytes)?)
     }
 
     /// Attempt to read a message, blocking for up to the specified duration if necessary until one becomes
@@ -344,10 +314,10 @@ impl Receiver {
         T: for<'de> Deserialize<'de>,
     {
         Ok(
-            if let Some((value, position)) = self.recv_timeout_0(Some(timeout))? {
+            if let Some((bytes, position)) = self.recv_timeout_0(Some(timeout))? {
                 self.seek(position)?;
 
-                Some(value)
+                Some(bincode::deserialize(bytes)?)
             } else {
                 None
             },
@@ -378,43 +348,13 @@ impl Receiver {
         }
     }
 
-    fn recv_timeout_0<'a, T: Deserialize<'a>>(
-        &'a self,
-        timeout: Option<Duration>,
-    ) -> Result<Option<(T, u32)>> {
-        let mut deadline = None;
-        loop {
-            if let Some(value_and_position) = self.try_recv_0()? {
-                return Ok(Some(value_and_position));
-            }
-
-            let buffer = self.0 .0.buffer();
-
-            let mut now = Instant::now();
-            deadline = deadline.or_else(|| timeout.map(|timeout| now + timeout));
-
-            let read = buffer.header().read.load(Relaxed);
-
-            let mut lock = buffer.lock()?;
-            while read == buffer.header().write.load(Acquire) {
-                if deadline.map(|deadline| deadline > now).unwrap_or(true) {
-                    lock.timed_wait(&self.0 .0, deadline.map(|deadline| deadline - now))?;
-
-                    now = Instant::now();
-                } else {
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
-    fn recv_direct_timeout_0<'a>(
+    fn recv_timeout_0<'a>(
         &'a self,
         timeout: Option<Duration>,
     ) -> Result<Option<(&'a [u8], u32)>> {
         let mut deadline = None;
         loop {
-            if let Some(value_and_position) = self.try_recv_direct_0()? {
+            if let Some(value_and_position) = self.try_recv_0()? {
                 return Ok(Some(value_and_position));
             }
 
@@ -464,9 +404,9 @@ impl<'a> ZeroCopyContext<'a> {
             Err(Error::AlreadyReceived)
         } else {
             Ok(
-                if let Some((value, position)) = self.receiver.try_recv_0()? {
+                if let Some((bytes, position)) = self.receiver.try_recv_0()? {
                     self.position = Some(position);
-                    Some(value)
+                    Some(bincode::deserialize(bytes)?)
                 } else {
                     None
                 },
@@ -484,9 +424,9 @@ impl<'a> ZeroCopyContext<'a> {
             Err(Error::AlreadyReceived)
         } else {
             Ok(
-                if let Some((value, position)) = self.receiver.try_recv_direct_0()? {
+                if let Some((bytes, position)) = self.receiver.try_recv_0()? {
                     self.position = Some(position);
-                    Some(value)
+                    Some(bytes)
                 } else {
                     None
                 },
@@ -499,11 +439,11 @@ impl<'a> ZeroCopyContext<'a> {
     /// This will return `Err(`[`Error::AlreadyReceived`](enum.Error.html#variant.AlreadyReceived)`))` if this
     /// instance has already been used to read a message.
     pub fn recv<'b, T: Deserialize<'b>>(&'b mut self) -> Result<T> {
-        let (value, position) = self.receiver.recv_timeout_0(None)?.unwrap();
+        let (bytes, position) = self.receiver.recv_timeout_0(None)?.unwrap();
 
         self.position = Some(position);
 
-        Ok(value)
+        Ok(bincode::deserialize(bytes)?)
     }
 
     /// Attempt to read a direct byte message, blocking if necessary until one becomes available.
@@ -511,11 +451,11 @@ impl<'a> ZeroCopyContext<'a> {
     /// This will return `Err(`[`Error::AlreadyReceived`](enum.Error.html#variant.AlreadyReceived)`))` if this
     /// instance has already been used to read a message.
     pub fn recv_direct<'b>(&'b mut self) -> Result<&'b [u8]> {
-        let (value, position) = self.receiver.recv_direct_timeout_0(None)?.unwrap();
+        let (bytes, position) = self.receiver.recv_timeout_0(None)?.unwrap();
 
         self.position = Some(position);
 
-        Ok(value)
+        Ok(bytes)
     }
 
     /// Attempt to read a message, blocking for up to the specified duration if necessary until one becomes
@@ -531,9 +471,9 @@ impl<'a> ZeroCopyContext<'a> {
             Err(Error::AlreadyReceived)
         } else {
             Ok(
-                if let Some((value, position)) = self.receiver.recv_timeout_0(Some(timeout))? {
+                if let Some((bytes, position)) = self.receiver.recv_timeout_0(Some(timeout))? {
                     self.position = Some(position);
-                    Some(value)
+                    Some(bincode::deserialize(bytes)?)
                 } else {
                     None
                 },
@@ -554,9 +494,9 @@ impl<'a> ZeroCopyContext<'a> {
             Err(Error::AlreadyReceived)
         } else {
             Ok(
-                if let Some((value, position)) = self.receiver.recv_direct_timeout_0(Some(timeout))? {
+                if let Some((bytes, position)) = self.receiver.recv_timeout_0(Some(timeout))? {
                     self.position = Some(position);
-                    Some(value)
+                    Some(bytes)
                 } else {
                     None
                 },
@@ -622,7 +562,8 @@ impl Sender {
     }
 
     /// Send the specified message, waiting for sufficient contiguous space to become available in the ring buffer
-    /// if necessary. Uses the lower level `ShmWriter` trait to write messages directly into the mmap buffer.
+    /// if necessary. Uses the lower level `ShmWriter` trait to write messages directly into the mmap buffer. Is 
+    /// inherently unsafe due to complete control it gives over writing to memory.
     ///
     /// The size of the message must be greater than zero or else this method will return
     /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the message size is
@@ -634,7 +575,7 @@ impl Sender {
 
     /// Send the specified message, waiting for sufficient contiguous space to become available in the ring buffer
     /// if necessary, but only up to the specified timeout. Uses the lower level `ShmWriter` trait to write messages 
-    /// directly into the mmap buffer.
+    /// directly into the mmap buffer. Is inherently unsafe due to complete control it gives over writing to memory.
     /// 
     /// This will return `Ok(true)` if the message was sent, or `Ok(false)` if it timed out while waiting.
     ///
@@ -647,7 +588,8 @@ impl Sender {
     }
 
     /// Send the specified message, waiting for the ring buffer to become completely empty first. Uses the lower 
-    /// level `ShmWriter` trait to write messages directly into the mmap buffer.
+    /// level `ShmWriter` trait to write messages directly into the mmap buffer. Is  inherently unsafe due to complete 
+    /// control it gives over writing to memory.
     /// 
     /// This method is appropriate for sending time-sensitive messages where buffering would introduce undesirable
     /// latency.
@@ -694,13 +636,11 @@ impl Sender {
                 } else if read != BEGINNING {
                     assert!(write > BEGINNING);
 
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            0u32.to_be_bytes().as_ptr(), 
-                            map.as_mut_ptr().offset(write as isize), 
-                            4,
-                        );
-                    }
+                    std::ptr::copy_nonoverlapping(
+                        0u32.to_be_bytes().as_ptr(), 
+                        map.as_mut_ptr().offset(write as isize), 
+                        4,
+                    );
 
                     write = BEGINNING;
                     buffer.header().write.store(write, Release);
