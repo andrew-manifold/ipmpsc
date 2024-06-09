@@ -11,10 +11,16 @@ use memmap2::MmapMut;
 use os::{Buffer, Header, View};
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::UnsafeCell, convert::TryInto, ffi::c_void, fs::{File, OpenOptions}, mem, sync::{
+    cell::UnsafeCell,
+    convert::TryInto,
+    ffi::c_void,
+    fs::{File, OpenOptions},
+    mem,
+    sync::{
         atomic::Ordering::{Acquire, Relaxed, Release},
         Arc,
-    }, time::{Duration, Instant}
+    },
+    time::{Duration, Instant},
 };
 use tempfile::NamedTempFile;
 use thiserror::Error as ThisError;
@@ -114,8 +120,8 @@ fn map(file: &File) -> Result<MmapMut> {
 /// Trait for when `bincode`'s overhead is unacceptable and the developer would prefer to
 /// directly write the message's contents into the mmap buffer without an additional copy and/or serialization.
 ///
-/// `msg_len` is the encoded size of the message in bytes. 
-/// `write_to_shm` allows for directly copying contents of the implementing struct into the 
+/// `msg_len` is the encoded size of the message in bytes.
+/// `write_to_shm` allows for directly copying contents of the implementing struct into the
 /// message's space in the buffer. This is incredibly unsafe and fully up to the developer
 /// to account for padding, alignment, proper offsetting etc. or you will cause mayhem.
 pub trait ShmWriter {
@@ -272,15 +278,12 @@ impl Receiver {
                 let size = if let Ok(fixed) = slice[read as usize..start as usize].try_into() {
                     u32::from_be_bytes(fixed)
                 } else {
-                    return Err(Error::Runtime("bad uncast of message size".into()))
+                    return Err(Error::Runtime("bad uncast of message size".into()));
                 };
 
                 if size > 0 {
                     let end = start + size;
-                    break Some((
-                        &slice[start as usize..end as usize],
-                        end,
-                    ));
+                    break Some((&slice[start as usize..end as usize], end));
                 } else if write < read {
                     read = BEGINNING;
                     let mut lock = buffer.lock()?;
@@ -348,10 +351,7 @@ impl Receiver {
         }
     }
 
-    fn recv_timeout_0<'a>(
-        &'a self,
-        timeout: Option<Duration>,
-    ) -> Result<Option<(&'a [u8], u32)>> {
+    fn recv_timeout_0<'a>(&'a self, timeout: Option<Duration>) -> Result<Option<(&'a [u8], u32)>> {
         let mut deadline = None;
         loop {
             if let Some(value_and_position) = self.try_recv_0()? {
@@ -486,10 +486,7 @@ impl<'a> ZeroCopyContext<'a> {
     ///
     /// This will return `Err(`[`Error::AlreadyReceived`](enum.Error.html#variant.AlreadyReceived)`))` if this
     /// instance has already been used to read a message.
-    pub fn recv_direct_timeout<'b>(
-        &'b mut self,
-        timeout: Duration,
-    ) -> Result<Option<&'b [u8]>> {
+    pub fn recv_direct_timeout<'b>(&'b mut self, timeout: Duration) -> Result<Option<&'b [u8]>> {
         if self.position.is_some() {
             Err(Error::AlreadyReceived)
         } else {
@@ -532,7 +529,8 @@ impl Sender {
     /// greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
     pub fn send(&self, value: &impl Serialize) -> Result<()> {
-        unsafe { self.send_timeout_0(&BincodeShmWriter(value), false, None).map(drop) }
+        self.send_timeout_0(&BincodeShmWriter(value), false, None)
+            .map(drop)
     }
 
     /// Send the specified message, waiting for sufficient contiguous space to become available in the ring buffer
@@ -545,7 +543,7 @@ impl Sender {
     /// greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
     pub fn send_timeout(&self, value: &impl Serialize, timeout: Duration) -> Result<bool> {
-        unsafe { self.send_timeout_0(&BincodeShmWriter(value), false, Some(timeout)) }
+        self.send_timeout_0(&BincodeShmWriter(value), false, Some(timeout))
     }
 
     /// Send the specified message, waiting for the ring buffer to become completely empty first.
@@ -558,39 +556,40 @@ impl Sender {
     /// is greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
     pub fn send_when_empty(&self, value: &impl Serialize) -> Result<()> {
-        unsafe { self.send_timeout_0(&BincodeShmWriter(value), true, None).map(drop) }
+        self.send_timeout_0(&BincodeShmWriter(value), true, None)
+            .map(drop)
     }
 
     /// Send the specified message, waiting for sufficient contiguous space to become available in the ring buffer
-    /// if necessary. Uses the lower level `ShmWriter` trait to write messages directly into the mmap buffer. Is 
+    /// if necessary. Uses the lower level `ShmWriter` trait to write messages directly into the mmap buffer. Is
     /// inherently unsafe due to complete control it gives over writing to memory.
     ///
     /// The size of the message must be greater than zero or else this method will return
     /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the message size is
     /// greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
-    pub unsafe fn send_direct(&self, value: &impl ShmWriter) -> Result<()> {
+    pub fn send_direct(&self, value: &impl ShmWriter) -> Result<()> {
         self.send_timeout_0(value, false, None).map(drop)
     }
 
     /// Send the specified message, waiting for sufficient contiguous space to become available in the ring buffer
-    /// if necessary, but only up to the specified timeout. Uses the lower level `ShmWriter` trait to write messages 
+    /// if necessary, but only up to the specified timeout. Uses the lower level `ShmWriter` trait to write messages
     /// directly into the mmap buffer. Is inherently unsafe due to complete control it gives over writing to memory.
-    /// 
+    ///
     /// This will return `Ok(true)` if the message was sent, or `Ok(false)` if it timed out while waiting.
     ///
     /// The size of the message must be greater than zero or else this method will return
     /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the size is
     /// greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
-    pub unsafe fn send_direct_timeout(&self, value: &impl ShmWriter, timeout: Duration) -> Result<bool> {
+    pub fn send_direct_timeout(&self, value: &impl ShmWriter, timeout: Duration) -> Result<bool> {
         self.send_timeout_0(value, false, Some(timeout))
     }
 
-    /// Send the specified message, waiting for the ring buffer to become completely empty first. Uses the lower 
-    /// level `ShmWriter` trait to write messages directly into the mmap buffer. Is  inherently unsafe due to complete 
+    /// Send the specified message, waiting for the ring buffer to become completely empty first. Uses the lower
+    /// level `ShmWriter` trait to write messages directly into the mmap buffer. Is  inherently unsafe due to complete
     /// control it gives over writing to memory.
-    /// 
+    ///
     /// This method is appropriate for sending time-sensitive messages where buffering would introduce undesirable
     /// latency.
     ///
@@ -598,11 +597,11 @@ impl Sender {
     /// `Err(`[`Error::ZeroSizedMessage`](enum.Error.html#variant.ZeroSizedMessage)`))`.  If the size
     /// is greater than the ring buffer capacity, this method will return
     /// `Err(`[`Error::MessageTooLarge`](enum.Error.html#variant.MessageTooLarge)`))`.
-    pub unsafe fn send_direct_when_empty(&self, value: &impl ShmWriter) -> Result<()> {
+    pub fn send_direct_when_empty(&self, value: &impl ShmWriter) -> Result<()> {
         self.send_timeout_0(value, true, None).map(drop)
     }
 
-    unsafe fn send_timeout_0(
+    fn send_timeout_0(
         &self,
         value: &impl ShmWriter,
         wait_until_empty: bool,
@@ -636,11 +635,8 @@ impl Sender {
                 } else if read != BEGINNING {
                     assert!(write > BEGINNING);
 
-                    std::ptr::copy_nonoverlapping(
-                        0u32.to_be_bytes().as_ptr(), 
-                        map.as_mut_ptr().offset(write as isize), 
-                        4,
-                    );
+                    let bytes = 0_u32.to_be_bytes();
+                    map[write as usize..(write + 4) as usize].copy_from_slice(&bytes);
 
                     write = BEGINNING;
                     buffer.header().write.store(write, Release);
@@ -661,20 +657,13 @@ impl Sender {
             }
         }
 
-        // write our msg size first
-        std::ptr::copy_nonoverlapping(
-            size.to_be_bytes().as_ptr(), 
-            map.as_mut_ptr().offset(write as isize), 
-            4,
-        );
-
         let start = write + 4;
+        let bytes = size.to_be_bytes();
+        map[write as usize..start as usize].copy_from_slice(&bytes);
 
         let end = start + size;
 
-        value.write_to_shm(
-            &mut map[start as usize .. end as usize], 
-        )?;
+        value.write_to_shm(&mut map[start as usize..end as usize])?;
 
         buffer.header().write.store(end, Release);
 
@@ -691,10 +680,79 @@ mod tests {
     use proptest::{arbitrary::any, collection::vec, prop_assume, proptest, strategy::Strategy};
     use std::thread;
 
+    #[derive(Debug, Clone, PartialEq)]
+    #[repr(C)]
+    struct DirectData {
+        ts: u64,
+        uint_val: u8,
+        int64_val: i64,
+    }
+
+    impl DirectData {
+        fn from_bytes(bytes: &[u8]) -> Result<DirectData> {
+            let mut offset = 0;
+
+            let read_size = std::mem::size_of::<u64>();
+            let ts = u64::from_be_bytes(
+                bytes[offset as usize..(offset + read_size) as usize].try_into()?,
+            );
+            offset += read_size;
+
+            let read_size = std::mem::size_of::<u8>();
+            let uint_val = u8::from_be_bytes(
+                bytes[offset as usize..(offset + read_size) as usize].try_into()?,
+            );
+            offset += read_size;
+
+            let read_size = std::mem::size_of::<i64>();
+            let int64_val = i64::from_be_bytes(
+                bytes[offset as usize..(offset + read_size) as usize].try_into()?,
+            );
+
+            Ok(Self {
+                ts,
+                uint_val,
+                int64_val,
+            })
+        }
+    }
+
+    impl ShmWriter for DirectData {
+        fn msg_len(&self) -> crate::Result<u64> {
+            Ok(
+                (std::mem::size_of::<u64>()
+                    + std::mem::size_of::<u8>()
+                    + std::mem::size_of::<i64>()) as u64,
+            )
+        }
+
+        // a direct writer example where bytes are cast directly into shared memory w/o padding
+        fn write_to_shm(&self, shm_ptr: &mut [u8]) -> crate::Result<()> {
+            let mut offset = 0;
+
+            let bytes = self.ts.to_be_bytes();
+            let write_size = bytes.len();
+            shm_ptr[offset..(offset + write_size)].copy_from_slice(&bytes);
+            offset += write_size;
+
+            let bytes = self.uint_val.to_be_bytes();
+            let write_size = bytes.len();
+            shm_ptr[offset..(offset + write_size)].copy_from_slice(&bytes);
+            offset += write_size;
+
+            let bytes = self.int64_val.to_be_bytes();
+            let write_size = bytes.len();
+            shm_ptr[offset..(offset + write_size)].copy_from_slice(&bytes);
+
+            Ok(())
+        }
+    }
+
     #[derive(Debug)]
     struct Case {
         channel_size: u32,
         data: Vec<Vec<u8>>,
+        direct_data: Vec<DirectData>,
         sender_count: u32,
     }
 
@@ -753,6 +811,64 @@ mod tests {
 
             Ok(())
         }
+
+        fn run_direct(&self) -> Result<()> {
+            let (name, buffer) = SharedRingBuffer::create_temp(self.channel_size)?;
+            let mut rx = Receiver::new(buffer);
+
+            let receiver_thread = if self.sender_count == 1 {
+                // Only one sender means we can expect to receive in a predictable order:
+                let expected = self.direct_data.clone();
+                thread::spawn(move || -> Result<()> {
+                    for item in &expected {
+                        let mut ctx = rx.zero_copy_context();
+                        let bytes = ctx.recv_direct()?;
+                        let received = DirectData::from_bytes(bytes)?;
+
+                        assert_eq!(item, &received);
+                    }
+
+                    Ok(())
+                })
+            } else {
+                // Multiple senders mean we'll receive in an unpredictable order, so just verify we receive the
+                // expected number of messages:
+                let expected = self.direct_data.len() * self.sender_count as usize;
+                thread::spawn(move || -> Result<()> {
+                    for _ in 0..expected {
+                        rx.recv::<Vec<u8>>()?;
+                    }
+                    Ok(())
+                })
+            };
+
+            let data = Arc::new(self.direct_data.clone());
+            let sender_threads = (0..self.sender_count)
+                .map(move |_| {
+                    os::test::fork({
+                        let name = name.clone();
+                        let data = data.clone();
+                        move || -> Result<()> {
+                            let tx = Sender::new(SharedRingBuffer::open(&name)?);
+
+                            for item in data.as_ref() {
+                                tx.send_direct(item)?;
+                            }
+
+                            Ok(())
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            for thread in sender_threads {
+                thread.join().map_err(|e| anyhow!("{:?}", e))??;
+            }
+
+            receiver_thread.join().map_err(|e| anyhow!("{:?}", e))??;
+
+            Ok(())
+        }
     }
 
     fn arb_case() -> impl Strategy<Value = Case> {
@@ -761,6 +877,13 @@ mod tests {
                 Case {
                     channel_size,
                     data,
+                    direct_data: (0..1024)
+                        .map(|n| DirectData {
+                            ts: n,
+                            uint_val: n as u8 % u8::MAX,
+                            int64_val: n as i64,
+                        })
+                        .collect::<Vec<_>>(),
                     sender_count,
                 }
             })
@@ -774,9 +897,35 @@ mod tests {
             data: (0..1024)
                 .map(|_| (0_u8..101).collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
+            direct_data: (0..1024)
+                .map(|n| DirectData {
+                    ts: n,
+                    uint_val: n as u8 % u8::MAX,
+                    int64_val: n as i64,
+                })
+                .collect::<Vec<_>>(),
             sender_count: 1,
         }
         .run()
+    }
+
+    #[test]
+    fn simple_direct_case() -> Result<()> {
+        Case {
+            channel_size: 1024,
+            data: (0..1024)
+                .map(|_| (0_u8..101).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            direct_data: (0..1024)
+                .map(|n| DirectData {
+                    ts: n,
+                    uint_val: n as u8 % u8::MAX,
+                    int64_val: n as i64,
+                })
+                .collect::<Vec<_>>(),
+            sender_count: 1,
+        }
+        .run_direct()
     }
 
     #[test]
