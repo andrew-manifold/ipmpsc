@@ -662,7 +662,6 @@ impl Sender {
         map[write as usize..start as usize].copy_from_slice(&bytes);
 
         let end = start + size;
-
         value.write_to_shm(&mut map[start as usize..end as usize])?;
 
         buffer.header().write.store(end, Release);
@@ -686,6 +685,12 @@ mod tests {
         ts: u64,
         uint_val: u8,
         int64_val: i64,
+    }
+
+    impl DirectData {
+        fn test() -> Self {
+            Self { ts: 1001, uint_val: 75, int64_val: 19191919 }
+        }
     }
 
     impl DirectData {
@@ -767,6 +772,7 @@ mod tests {
                 thread::spawn(move || -> Result<()> {
                     for item in &expected {
                         let received = rx.recv::<Vec<u8>>()?;
+                        assert_eq!(item.len(), received.len());
                         assert_eq!(item, &received);
                     }
 
@@ -985,6 +991,33 @@ mod tests {
     }
 
     #[test]
+    fn slow_direct_sender_with_recv_timeout() -> Result<()> {
+        let (name, buffer) = SharedRingBuffer::create_temp(256)?;
+        let mut rx = Receiver::new(buffer);
+        let tx = Sender::new(SharedRingBuffer::open(&name)?);
+
+        let direct_data = DirectData::test();
+
+        let sender = os::test::fork(move || {
+            thread::sleep(Duration::from_secs(1));
+            tx.send_direct(&direct_data).map_err(anyhow::Error::from)
+        })?;
+
+        loop {
+            if let Some(bytes) = rx.zero_copy_context().recv_direct_timeout(Duration::from_millis(1))? {
+                let recv_val = DirectData::from_bytes(bytes)?;
+                
+                assert_eq!(DirectData::test(), recv_val);
+                break;
+            }
+        }
+
+        sender.join().map_err(|e| anyhow!("{:?}", e))??;
+
+        Ok(())
+    }
+
+    #[test]
     fn slow_receiver_with_send_timeout() -> Result<()> {
         let (name, buffer) = SharedRingBuffer::create_temp(256)?;
         let rx = Receiver::new(buffer);
@@ -1004,11 +1037,55 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn slow_direct_receiver_with_send_timeout() -> Result<()> {
+        let (name, buffer) = SharedRingBuffer::create_temp(256)?;
+        let mut rx = Receiver::new(buffer);
+        let tx = Sender::new(SharedRingBuffer::open(&name)?);
+
+        let direct_data = DirectData::test();
+
+        let sender = os::test::fork(move || loop {
+            if tx.send_direct_timeout(&direct_data, Duration::from_millis(1))? {
+                break Ok(());
+            }
+        })?;
+
+        thread::sleep(Duration::from_secs(1));
+
+        let mut ctx = rx.zero_copy_context();
+
+        let bytes = ctx.recv_direct()?;
+        let recv_val = DirectData::from_bytes(bytes)?;
+
+        assert_eq!(DirectData::test(), recv_val);
+
+        sender.join().map_err(|e| anyhow!("{:?}", e))??;
+
+        Ok(())
+    }
+
     proptest! {
         #[test]
         fn arbitrary_case(case in arb_case()) {
             let result = thread::spawn(move || {
                 let result = case.run();
+                if let Err(e) = &result {
+                    println!("\ntrouble: {:?}", e);
+                } else if false {
+                    print!(".");
+                    std::io::Write::flush(&mut std::io::stdout())?;
+                }
+                result
+            }).join().unwrap();
+
+            prop_assume!(result.is_ok(), "error: {:?}", result.unwrap_err());
+        }
+
+        #[test]
+        fn arbitrary_direct_case(case in arb_case()) {
+            let result = thread::spawn(move || {
+                let result = case.run_direct();
                 if let Err(e) = &result {
                     println!("\ntrouble: {:?}", e);
                 } else if false {
