@@ -70,6 +70,8 @@ impl<T: Serialize> ShmSerializer for BincodeSerializer<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use anyhow::{anyhow, Error, Result};
     use ipc_channel::ipc;
