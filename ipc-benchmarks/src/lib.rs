@@ -2,9 +2,8 @@
 
 extern crate test;
 
-use serde_derive::{Deserialize, Serialize};
-
-use std::time::Duration;
+use ipmpsc::{ShmDeserializer, ShmSerializer, ShmZeroCopyDeserializer};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct YuvFrameInfo {
@@ -37,12 +36,44 @@ pub struct OwnedYuvFrame {
     pub v_pixels: Vec<u8>,
 }
 
+#[derive(Debug)]
+pub struct BincodeZeroCopyDeserializer<T>(pub T);
+
+impl<'de, T> ShmZeroCopyDeserializer<'de> for BincodeZeroCopyDeserializer<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize_from_bytes(bytes: &'de [u8]) -> ipmpsc::Result<Self> {
+        Ok(Self(bincode::deserialize::<T>(bytes)?))
+    }
+}
+
+#[derive(Debug)]
+pub struct BincodeDeserializer<T>(pub T);
+
+impl<T> ShmDeserializer for BincodeDeserializer<T>
+where T: for<'de> Deserialize<'de>
+{
+    fn deserialize_from_bytes<'de>(bytes: &'de [u8]) -> ipmpsc::Result<Self> {
+        Ok(Self(bincode::deserialize::<T>(bytes)?))
+    }
+}
+
+#[derive(Debug)]
+pub struct BincodeSerializer<T: Serialize>(pub T);
+
+impl<T: Serialize> ShmSerializer for BincodeSerializer<T> {
+    fn serialize(&self) -> ipmpsc::Result<Vec<u8>> {
+        Ok(bincode::serialize(&self.0)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::{anyhow, Error, Result};
     use ipc_channel::ipc;
-    use ipmpsc::{Receiver, Sender, SharedRingBuffer};
+    use ipmpsc::{Receiver, Sender, SharedRingBuffer, ShmDeserializer, ShmSerializer};
     use test::Bencher;
 
     const SMALL: (usize, usize) = (3, 2);
@@ -97,8 +128,8 @@ mod tests {
                 v_pixels: &v_pixels,
             };
 
-            while exit_rx.try_recv::<u8>()?.is_none() {
-                tx.send_timeout(&frame, Duration::from_millis(100))?;
+            while exit_rx.try_recv::<BincodeDeserializer<u8>>()?.is_none() {
+                tx.send_timeout(&BincodeSerializer(&frame), Duration::from_millis(100))?;
             }
 
             Ok(())
@@ -107,20 +138,20 @@ mod tests {
         // wait for first frame to arrive
         {
             let mut context = rx.zero_copy_context();
-            if let Err(e) = context.recv::<YuvFrame>() {
+            if let Err(e) = context.recv::<BincodeZeroCopyDeserializer<YuvFrame>>() {
                 panic!("error receiving: {:?}", e);
             };
         }
 
         bencher.iter(|| {
             let mut context = rx.zero_copy_context();
-            match context.recv::<YuvFrame>() {
+            match context.recv::<BincodeZeroCopyDeserializer<YuvFrame>>() {
                 Err(e) => panic!("error receiving: {:?}", e),
                 Ok(frame) => test::black_box(&frame),
             };
         });
 
-        exit_tx.send(&1_u8)?;
+        exit_tx.send(&BincodeSerializer(1_u8))?;
 
         sender.join().map_err(|e| anyhow!("{:?}", e))??;
 
@@ -147,7 +178,7 @@ mod tests {
             let exit_buffer = SharedRingBuffer::open(&exit_name)?;
             let exit_rx = Receiver::new(exit_buffer);
 
-            while exit_rx.try_recv::<u8>()?.is_none() {
+            while exit_rx.try_recv::<BincodeDeserializer<u8>>()?.is_none() {
                 let y_pixels = vec![128_u8; y_stride(width) * height];
                 let u_pixels = vec![192_u8; uv_stride(width) * height / 2];
                 let v_pixels = vec![255_u8; uv_stride(width) * height / 2];
@@ -166,7 +197,7 @@ mod tests {
                 };
 
                 if let Err(e) = tx.send(frame) {
-                    if exit_rx.try_recv::<u8>()?.is_none() {
+                    if exit_rx.try_recv::<BincodeDeserializer<u8>>()?.is_none() {
                         return Err(Error::from(e));
                     } else {
                         break;
@@ -187,7 +218,7 @@ mod tests {
             };
         });
 
-        exit_tx.send(&1_u8)?;
+        exit_tx.send(&BincodeSerializer(1_u8))?;
 
         while rx.recv().is_ok() {}
 
@@ -239,10 +270,10 @@ mod tests {
             let size = bincode::serialized_size(&frame).unwrap() as usize;
             let mut buffer = vec![0_u8; size];
 
-            while exit_rx.try_recv::<u8>()?.is_none() {
+            while exit_rx.try_recv::<BincodeDeserializer<u8>>()?.is_none() {
                 bincode::serialize_into(&mut buffer as &mut [u8], &frame).unwrap();
                 if let Err(e) = tx.send(&buffer) {
-                    if exit_rx.try_recv::<u8>()?.is_none() {
+                    if exit_rx.try_recv::<BincodeDeserializer<u8>>()?.is_none() {
                         return Err(Error::from(e));
                     } else {
                         break;
@@ -263,7 +294,7 @@ mod tests {
             };
         });
 
-        exit_tx.send(&1_u8)?;
+        exit_tx.send(&BincodeSerializer(1_u8))?;
 
         while rx.recv().is_ok() {}
 
