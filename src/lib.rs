@@ -10,10 +10,18 @@
 use memmap2::MmapMut;
 use os::{Buffer, Header, View};
 use std::{
-    array::TryFromSliceError, cell::UnsafeCell, convert::TryInto, ffi::c_void, fs::{File, OpenOptions}, mem, sync::{
+    array::TryFromSliceError,
+    cell::UnsafeCell,
+    convert::TryInto,
+    ffi::c_void,
+    fmt::{Debug, Display},
+    fs::{File, OpenOptions},
+    mem,
+    sync::{
         atomic::Ordering::{Acquire, Relaxed, Release},
         Arc,
-    }, time::{Duration, Instant}
+    },
+    time::{Duration, Instant},
 };
 use tempfile::NamedTempFile;
 use thiserror::Error as ThisError;
@@ -83,9 +91,9 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    /// Wrapped bincode error encountered during (de)serialization.
+    /// Errors from ser/deser operations.
     #[error(transparent)]
-    Bincode(#[from] bincode::Error),
+    Serialize(#[from] SerializeError),
 
     /// Errors from converting little endian bytes to u32 will be caught here.
     #[error(transparent)]
@@ -114,21 +122,39 @@ fn map(file: &File) -> Result<MmapMut> {
     }
 }
 
+/// `ipmpsc`-specific error type
+#[derive(ThisError, Debug)]
+pub enum SerializeError {
+    #[error("failed to serialize: {0:?} => {1}@{2}")]
+    FailedSerialize(String, u32, &'static str),
+
+    #[error("failed to deserialize: {0:?} => {1}@{2}")]
+    FailedDeserialize(String, u32, &'static str),
+}
+
+pub type SerializeResult<T> = std::result::Result<T, SerializeError>;
+
 /// Trait apis to decouple the serialization backend from the mechanical send/recv
 /// For a writer to work the payload must implement this trait
 pub trait ShmSerializer {
-    fn serialize(&self) -> Result<Vec<u8>>;
+    type Error: Display;
+
+    fn serialize(&self) -> std::result::Result<Vec<u8>, Self::Error>;
 }
 
 /// For a reader to work they payload must implement this trait
 pub trait ShmDeserializer: Sized {
-    fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self>;
+    type Error: Display;
+
+    fn deserialize_from_bytes(bytes: &[u8]) -> std::result::Result<Self, Self::Error>;
 }
 
 /// To use the zero_copy_context the payload must implement this trait allowing for more
 /// explict lifetimes
 pub trait ShmZeroCopyDeserializer<'de>: Sized {
-    fn deserialize_from_bytes(bytes: &'de [u8]) -> Result<Self>;
+    type Error: Display;
+
+    fn deserialize_from_bytes(bytes: &'de [u8]) -> std::result::Result<Self, Self::Error>;
 }
 
 /// Represents a file-backed shared memory ring buffer, suitable for constructing a
@@ -237,8 +263,7 @@ impl Receiver {
     /// Attempt to read a message without blocking.
     ///
     /// This will return `Ok(None)` if there are no messages immediately available.
-    pub fn try_recv<T: ShmDeserializer>(&self) -> Result<Option<T>>
-    {
+    pub fn try_recv<T: ShmDeserializer>(&self) -> Result<Option<T>> {
         Ok(if let Some((value, position)) = self.try_recv_0::<T>()? {
             self.seek(position)?;
 
@@ -264,7 +289,15 @@ impl Receiver {
                 if size > 0 {
                     let end = start + size;
                     break Some((
-                        T::deserialize_from_bytes(&slice[start as usize..end as usize])?,
+                        T::deserialize_from_bytes(&slice[start as usize..end as usize]).map_err(
+                            |e| {
+                                Error::Serialize(SerializeError::FailedDeserialize(
+                                    e.to_string(),
+                                    line!(),
+                                    file!(),
+                                ))
+                            },
+                        )?,
                         end,
                     ));
                 } else if write < read {
@@ -297,7 +330,15 @@ impl Receiver {
                 if size > 0 {
                     let end = start + size;
                     break Some((
-                        T::deserialize_from_bytes(&slice[start as usize..end as usize])?,
+                        T::deserialize_from_bytes(&slice[start as usize..end as usize]).map_err(
+                            |e| {
+                                Error::Serialize(SerializeError::FailedDeserialize(
+                                    e.to_string(),
+                                    line!(),
+                                    file!(),
+                                ))
+                            },
+                        )?,
                         end,
                     ));
                 } else if write < read {
@@ -315,8 +356,7 @@ impl Receiver {
     }
 
     /// Attempt to read a message, blocking if necessary until one becomes available.
-    pub fn recv<T: ShmDeserializer>(&self) -> Result<T>
-    {
+    pub fn recv<T: ShmDeserializer>(&self) -> Result<T> {
         let (value, position) = self.recv_timeout_0::<T>(None)?.unwrap();
 
         self.seek(position)?;
@@ -326,8 +366,7 @@ impl Receiver {
 
     /// Attempt to read a message, blocking for up to the specified duration if necessary until one becomes
     /// available.
-    pub fn recv_timeout<T: ShmDeserializer>(&self, timeout: Duration) -> Result<Option<T>>
-    {
+    pub fn recv_timeout<T: ShmDeserializer>(&self, timeout: Duration) -> Result<Option<T>> {
         Ok(
             if let Some((value, position)) = self.recv_timeout_0::<T>(Some(timeout))? {
                 self.seek(position)?;
@@ -484,7 +523,9 @@ impl<'a> ZeroCopyContext<'a> {
             Err(Error::AlreadyReceived)
         } else {
             Ok(
-                if let Some((value, position)) = self.receiver.recv_zc_timeout_0::<T>(Some(timeout))? {
+                if let Some((value, position)) =
+                    self.receiver.recv_zc_timeout_0::<T>(Some(timeout))?
+                {
                     self.position = Some(position);
                     Some(value)
                 } else {
@@ -560,7 +601,13 @@ impl Sender {
         let buffer = self.0 .0.buffer();
         let map = self.0 .0.map_mut();
 
-        let bytes = value.serialize()?;
+        let bytes = value.serialize().map_err(|e| {
+            Error::Serialize(SerializeError::FailedSerialize(
+                e.to_string(),
+                line!(),
+                file!(),
+            ))
+        })?;
 
         let size = bytes.len() as u32;
 
@@ -627,7 +674,7 @@ mod tests {
     use super::*;
     use anyhow::{anyhow, Result};
     use proptest::{arbitrary::any, collection::vec, prop_assume, proptest, strategy::Strategy};
-    use serde::{Serialize, Deserialize};
+    use serde::{Deserialize, Serialize};
     use std::thread;
 
     #[derive(Debug)]
@@ -637,7 +684,9 @@ mod tests {
     where
         T: Deserialize<'de>,
     {
-        fn deserialize_from_bytes(bytes: &'de [u8]) -> super::Result<Self> {
+        type Error = bincode::Error;
+
+        fn deserialize_from_bytes(bytes: &'de [u8]) -> std::result::Result<Self, Self::Error> {
             Ok(Self(bincode::deserialize::<T>(bytes)?))
         }
     }
@@ -646,9 +695,12 @@ mod tests {
     pub struct BincodeDeserializer<T>(pub T);
 
     impl<T> ShmDeserializer for BincodeDeserializer<T>
-    where T: for<'de> Deserialize<'de>
+    where
+        T: for<'de> Deserialize<'de>,
     {
-        fn deserialize_from_bytes<'de>(bytes: &'de [u8]) -> super::Result<Self> {
+        type Error = bincode::Error;
+
+        fn deserialize_from_bytes<'de>(bytes: &'de [u8]) -> std::result::Result<Self, Self::Error> {
             Ok(Self(bincode::deserialize::<T>(bytes)?))
         }
     }
@@ -657,7 +709,9 @@ mod tests {
     pub struct BincodeSerializer<T: Serialize>(pub T);
 
     impl<T: Serialize> ShmSerializer for BincodeSerializer<T> {
-        fn serialize(&self) -> super::Result<Vec<u8>> {
+        type Error = bincode::Error;
+
+        fn serialize(&self) -> std::result::Result<Vec<u8>, Self::Error> {
             Ok(bincode::serialize(&self.0)?)
         }
     }
@@ -679,7 +733,7 @@ mod tests {
                 let expected = self.data.clone();
                 thread::spawn(move || -> Result<()> {
                     for item in &expected {
-                        let received = rx.recv::<BincodeDeserializer::<Vec<u8>>>()?;
+                        let received = rx.recv::<BincodeDeserializer<Vec<u8>>>()?;
                         assert_eq!(item, &received.0);
                     }
 
@@ -691,7 +745,7 @@ mod tests {
                 let expected = self.data.len() * self.sender_count as usize;
                 thread::spawn(move || -> Result<()> {
                     for _ in 0..expected {
-                        rx.recv::<BincodeDeserializer::<Vec<u8>>>()?;
+                        rx.recv::<BincodeDeserializer<Vec<u8>>>()?;
                     }
                     Ok(())
                 })
@@ -791,11 +845,14 @@ mod tests {
 
         let sender = os::test::fork(move || {
             thread::sleep(Duration::from_secs(1));
-            tx.send(&BincodeSerializer(42_u32)).map_err(anyhow::Error::from)
+            tx.send(&BincodeSerializer(42_u32))
+                .map_err(anyhow::Error::from)
         })?;
 
         loop {
-            if let Some(value) = rx.recv_timeout::<BincodeDeserializer<u32>>(Duration::from_millis(1))? {
+            if let Some(value) =
+                rx.recv_timeout::<BincodeDeserializer<u32>>(Duration::from_millis(1))?
+            {
                 assert_eq!(42_u32, value.0);
                 break;
             }

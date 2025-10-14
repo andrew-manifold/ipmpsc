@@ -2,7 +2,7 @@
 
 use clap::{App, Arg};
 use ipmpsc::{Receiver, SharedRingBuffer, ShmDeserializer, ShmZeroCopyDeserializer};
-use serde::{Deserialize};
+use serde::Deserialize;
 
 #[derive(Debug)]
 pub struct BincodeZeroCopyDeserializer<T>(pub T);
@@ -11,7 +11,9 @@ impl<'de, T> ShmZeroCopyDeserializer<'de> for BincodeZeroCopyDeserializer<T>
 where
     T: Deserialize<'de>,
 {
-    fn deserialize_from_bytes(bytes: &'de [u8]) -> ipmpsc::Result<Self> {
+    type Error = bincode::Error;
+
+    fn deserialize_from_bytes(bytes: &'de [u8]) -> std::result::Result<Self, Self::Error> {
         Ok(Self(bincode::deserialize::<T>(bytes)?))
     }
 }
@@ -20,13 +22,15 @@ where
 pub struct BincodeDeserializer<T>(pub T);
 
 impl<T> ShmDeserializer for BincodeDeserializer<T>
-where T: for<'de> Deserialize<'de>
+where
+    T: for<'de> Deserialize<'de>,
 {
-    fn deserialize_from_bytes<'de>(bytes: &'de [u8]) -> ipmpsc::Result<Self> {
+    type Error = bincode::Error;
+
+    fn deserialize_from_bytes<'de>(bytes: &'de [u8]) -> std::result::Result<Self, Self::Error> {
         Ok(Self(bincode::deserialize::<T>(bytes)?))
     }
 }
-
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = App::new("ipmpsc-send")
@@ -59,7 +63,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         if zero_copy {
-            println!("received {:?}", rx.zero_copy_context().recv::<BincodeZeroCopyDeserializer<&str>>()?);
+            println!(
+                "received {:?}",
+                rx.zero_copy_context()
+                    .recv::<BincodeZeroCopyDeserializer<&str>>()?
+            );
         } else {
             println!("received {:?}", rx.recv::<BincodeDeserializer<String>>()?);
         }

@@ -9,7 +9,9 @@ use std::io::{self, BufRead};
 pub struct BincodeSerializer<T: Serialize>(pub T);
 
 impl<T: Serialize> ShmSerializer for BincodeSerializer<T> {
-    fn serialize(&self) -> ipmpsc::Result<Vec<u8>> {
+    type Error = bincode::Error;
+
+    fn serialize(&self) -> std::result::Result<Vec<u8>, Self::Error> {
         Ok(bincode::serialize(&self.0)?)
     }
 }
