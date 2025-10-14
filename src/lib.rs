@@ -356,7 +356,7 @@ impl Receiver {
     /// 3. A given [`ZeroCopyContext`](struct.ZeroCopyContext.html) can only be used to deserialize a single
     /// message before it must be discarded since the read pointer is advanced only when the instance is dropped
     /// (enforced at run time).
-    pub fn zero_copy_context(&mut self) -> ZeroCopyContext {
+    pub fn zero_copy_context(&mut self) -> ZeroCopyContext<'_> {
         ZeroCopyContext {
             receiver: self,
             position: None,

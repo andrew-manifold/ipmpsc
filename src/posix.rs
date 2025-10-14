@@ -106,7 +106,7 @@ impl Buffer {
         }
     }
 
-    pub fn lock(&self) -> Result<Lock> {
+    pub fn lock(&self) -> Result<Lock<'_>> {
         Lock::try_new(self)
     }
 
@@ -122,7 +122,7 @@ impl Buffer {
 pub struct Lock<'a>(&'a Buffer);
 
 impl<'a> Lock<'a> {
-    pub fn try_new(buffer: &Buffer) -> Result<Lock> {
+    pub fn try_new(buffer: &Buffer) -> Result<Lock<'_>> {
         unsafe {
             nonzero!(libc::pthread_mutex_lock(buffer.header().mutex.get()))?;
         }
