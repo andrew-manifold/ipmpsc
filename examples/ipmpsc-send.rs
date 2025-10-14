@@ -1,8 +1,18 @@
 #![deny(warnings)]
 
 use clap::{App, Arg};
-use ipmpsc::{Sender, SharedRingBuffer};
+use ipmpsc::{Sender, SharedRingBuffer, ShmSerializer};
+use serde::Serialize;
 use std::io::{self, BufRead};
+
+#[derive(Debug)]
+pub struct BincodeSerializer<T: Serialize>(pub T);
+
+impl<T: Serialize> ShmSerializer for BincodeSerializer<T> {
+    fn serialize(&self) -> ipmpsc::Result<Vec<u8>> {
+        Ok(bincode::serialize(&self.0)?)
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = App::new("ipmpsc-send")
@@ -29,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Ready!  Enter some lines of text to send them to the receiver.");
 
     while handle.read_line(&mut buffer)? > 0 {
-        tx.send(&buffer)?;
+        tx.send::<BincodeSerializer<&String>>(&BincodeSerializer(&buffer))?;
         buffer.clear();
     }
 
