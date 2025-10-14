@@ -117,9 +117,6 @@ pub trait ShmSerializer {
     fn serialize(&self) -> Result<Vec<u8>>;
 }
 
-// pub trait ShmDeserializer {
-//     fn deserialize_from_bytes<'de>(bytes: &'de [u8]) -> Result<Self> where Self: Sized;
-// }
 pub trait ShmZeroCopyDeserializer<'de>: Sized {
     fn deserialize_from_bytes(bytes: &'de [u8]) -> Result<Self>;
 }
@@ -560,9 +557,6 @@ impl Sender {
 
         let size = bytes.len() as u32;
 
-        // DELETE
-        // let size = bincode::serialized_size(value)? as u32;
-
         if size == 0 {
             return Err(Error::ZeroSizedMessage);
         }
@@ -609,13 +603,9 @@ impl Sender {
 
         let start = write + 4;
         map[write as usize..start as usize].copy_from_slice(&size.to_le_bytes());
-        // DELETE
-        //bincode::serialize_into(&mut map[write as usize..start as usize], &size)?;
 
         let end = start + size;
         map[start as usize..end as usize].copy_from_slice(&bytes);
-        // DELETE
-        // bincode::serialize_into(&mut map[start as usize..end as usize], value)?;
 
         buffer.header().write.store(end, Release);
 
