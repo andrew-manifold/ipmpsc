@@ -43,6 +43,7 @@ impl<'de, T> ShmZeroCopyDeserializer<'de> for BincodeZeroCopyDeserializer<T>
 where
     T: Deserialize<'de>,
 {
+    #[inline(always)]
     fn deserialize_from_bytes(bytes: &'de [u8]) -> ipmpsc::Result<Self> {
         Ok(Self(bincode::deserialize::<T>(bytes)?))
     }
@@ -54,6 +55,7 @@ pub struct BincodeDeserializer<T>(pub T);
 impl<T> ShmDeserializer for BincodeDeserializer<T>
 where T: for<'de> Deserialize<'de>
 {
+    #[inline(always)]
     fn deserialize_from_bytes<'de>(bytes: &'de [u8]) -> ipmpsc::Result<Self> {
         Ok(Self(bincode::deserialize::<T>(bytes)?))
     }
@@ -63,6 +65,7 @@ where T: for<'de> Deserialize<'de>
 pub struct BincodeSerializer<T: Serialize>(pub T);
 
 impl<T: Serialize> ShmSerializer for BincodeSerializer<T> {
+    #[inline(always)]
     fn serialize(&self) -> ipmpsc::Result<Vec<u8>> {
         Ok(bincode::serialize(&self.0)?)
     }
