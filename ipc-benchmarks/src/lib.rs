@@ -43,8 +43,10 @@ impl<'de, T> ShmZeroCopyDeserializer<'de> for BincodeZeroCopyDeserializer<T>
 where
     T: Deserialize<'de>,
 {
+    type Error = bincode::Error;
+
     #[inline(always)]
-    fn deserialize_from_bytes(bytes: &'de [u8]) -> ipmpsc::Result<Self> {
+    fn deserialize_from_bytes(bytes: &'de [u8]) -> std::result::Result<Self, Self::Error> {
         Ok(Self(bincode::deserialize::<T>(bytes)?))
     }
 }
@@ -55,8 +57,10 @@ pub struct BincodeDeserializer<T>(pub T);
 impl<T> ShmDeserializer for BincodeDeserializer<T>
 where T: for<'de> Deserialize<'de>
 {
+    type Error = bincode::Error;
+
     #[inline(always)]
-    fn deserialize_from_bytes<'de>(bytes: &'de [u8]) -> ipmpsc::Result<Self> {
+    fn deserialize_from_bytes<'de>(bytes: &'de [u8]) -> std::result::Result<Self, Self::Error> {
         Ok(Self(bincode::deserialize::<T>(bytes)?))
     }
 }
@@ -65,8 +69,10 @@ where T: for<'de> Deserialize<'de>
 pub struct BincodeSerializer<T: Serialize>(pub T);
 
 impl<T: Serialize> ShmSerializer for BincodeSerializer<T> {
+    type Error = bincode::Error;
+
     #[inline(always)]
-    fn serialize(&self) -> ipmpsc::Result<Vec<u8>> {
+    fn serialize(&self) -> std::result::Result<Vec<u8>, Self::Error> {
         Ok(bincode::serialize(&self.0)?)
     }
 }
