@@ -87,6 +87,7 @@ pub enum Error {
     #[error(transparent)]
     Bincode(#[from] bincode::Error),
 
+    /// Errors from converting little endian bytes to u32 will be caught here.
     #[error(transparent)]
     TryFrom(#[from] TryFromSliceError),
 }
@@ -113,15 +114,21 @@ fn map(file: &File) -> Result<MmapMut> {
     }
 }
 
+/// Trait apis to decouple the serialization backend from the mechanical send/recv
+/// For a writer to work the payload must implement this trait
 pub trait ShmSerializer {
     fn serialize(&self) -> Result<Vec<u8>>;
 }
 
-pub trait ShmZeroCopyDeserializer<'de>: Sized {
-    fn deserialize_from_bytes(bytes: &'de [u8]) -> Result<Self>;
-}
+/// For a reader to work they payload must implement this trait
 pub trait ShmDeserializer: Sized {
     fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self>;
+}
+
+/// To use the zero_copy_context the payload must implement this trait allowing for more
+/// explict lifetimes
+pub trait ShmZeroCopyDeserializer<'de>: Sized {
+    fn deserialize_from_bytes(bytes: &'de [u8]) -> Result<Self>;
 }
 
 /// Represents a file-backed shared memory ring buffer, suitable for constructing a
