@@ -1,7 +1,7 @@
 //! Inter-Process Multiple Producer, Single Consumer Channels for Rust
 //!
 //! This library provides a type-safe, high-performance inter-process channel implementation based on a shared
-//! memory ring buffer.  It uses [bincode](https://github.com/TyOverby/bincode) for (de)serialization, including
+//! memory ring buffer.  It is agnostic to (de)serialization backends and includes the capability for
 //! zero-copy deserialization, making it ideal for messages with large `&str` or `&[u8]` fields.  And it has a name
 //! that rolls right off the tongue.
 
